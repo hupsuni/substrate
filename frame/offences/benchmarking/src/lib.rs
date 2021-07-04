@@ -38,11 +38,11 @@ use pallet_balances::Config as BalancesConfig;
 use pallet_babe::BabeEquivocationOffence;
 use pallet_grandpa::{GrandpaEquivocationOffence, GrandpaTimeSlot};
 use pallet_im_online::{Config as ImOnlineConfig, Pallet as ImOnline, UnresponsivenessOffence};
-use pallet_offences::{Config as OffencesConfig, Module as Offences};
+use pallet_offences::{Config as OffencesConfig, Pallet as Offences};
 use pallet_session::historical::{Config as HistoricalConfig, IdentificationTuple};
 use pallet_session::{Config as SessionConfig, SessionManager};
 use pallet_staking::{
-	Module as Staking, Config as StakingConfig, RewardDestination, ValidatorPrefs, Exposure,
+	Pallet as Staking, Config as StakingConfig, RewardDestination, ValidatorPrefs, Exposure,
 	IndividualExposure, Event as StakingEvent,
 };
 
