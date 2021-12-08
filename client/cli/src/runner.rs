@@ -20,7 +20,7 @@ use crate::{error::Error as CliError, CliConfiguration, Result, SubstrateCli};
 use chrono::prelude::*;
 use futures::{future, future::FutureExt, pin_mut, select, Future};
 use log::info;
-use sc_service::{Configuration, Error as ServiceError, TaskManager, TaskType};
+use sc_service::{Configuration, Error as ServiceError, TaskManager};
 use sc_utils::metrics::{TOKIO_THREADS_ALIVE, TOKIO_THREADS_TOTAL};
 use std::marker::PhantomData;
 
@@ -98,7 +98,7 @@ where
 	pin_mut!(f);
 
 	tokio_runtime.block_on(main(f))?;
-	tokio_runtime.block_on(task_manager.clean_shutdown());
+	drop(task_manager);
 
 	Ok(())
 }
@@ -116,15 +116,8 @@ impl<C: SubstrateCli> Runner<C> {
 		let tokio_runtime = build_runtime()?;
 		let runtime_handle = tokio_runtime.handle().clone();
 
-		let task_executor = move |fut, task_type| match task_type {
-			TaskType::Async => runtime_handle.spawn(fut).map(drop),
-			TaskType::Blocking => runtime_handle
-				.spawn_blocking(move || futures::executor::block_on(fut))
-				.map(drop),
-		};
-
 		Ok(Runner {
-			config: command.create_configuration(cli, task_executor.into())?,
+			config: command.create_configuration(cli, runtime_handle)?,
 			tokio_runtime,
 			phantom: PhantomData,
 		})
@@ -161,7 +154,6 @@ impl<C: SubstrateCli> Runner<C> {
 		self.print_node_infos();
 		let mut task_manager = self.tokio_runtime.block_on(initialize(self.config))?;
 		let res = self.tokio_runtime.block_on(main(task_manager.future().fuse()));
-		self.tokio_runtime.block_on(task_manager.clean_shutdown());
 		Ok(res?)
 	}
 

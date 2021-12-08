@@ -26,7 +26,6 @@ use codec::{Decode, Encode, HasCompact};
 use frame_support::{
 	storage::bounded_btree_map::BoundedBTreeMap,
 	traits::{Currency, Get, OnUnbalanced, ReservableCurrency},
-	DebugNoBound,
 };
 use sp_arithmetic::traits::SaturatedConversion;
 use sp_npos_elections::{is_score_better, ElectionScore, NposSolution};
@@ -43,7 +42,7 @@ use sp_std::{
 /// A raw, unchecked signed submission.
 ///
 /// This is just a wrapper around [`RawSolution`] and some additional info.
-#[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug, Default)]
+#[derive(PartialEq, Eq, Clone, Encode, Decode, RuntimeDebug, Default, scale_info::TypeInfo)]
 pub struct SignedSubmission<AccountId, Balance: HasCompact, Solution> {
 	/// Who submitted this solution.
 	pub who: AccountId,
@@ -113,7 +112,7 @@ pub enum InsertResult<T: Config> {
 /// Mask type which pretends to be a set of `SignedSubmissionOf<T>`, while in fact delegating to the
 /// actual implementations in `SignedSubmissionIndices<T>`, `SignedSubmissionsMap<T>`, and
 /// `SignedSubmissionNextIndex<T>`.
-#[cfg_attr(feature = "std", derive(DebugNoBound))]
+#[cfg_attr(feature = "std", derive(frame_support::DebugNoBound))]
 pub struct SignedSubmissions<T: Config> {
 	indices: SubmissionIndicesOf<T>,
 	next_idx: u32,
@@ -430,7 +429,7 @@ impl<T: Config> Pallet<T> {
 		<QueuedSolution<T>>::put(ready_solution);
 
 		// emit reward event
-		Self::deposit_event(crate::Event::Rewarded(who.clone(), reward));
+		Self::deposit_event(crate::Event::Rewarded { account: who.clone(), value: reward });
 
 		// unreserve deposit.
 		let _remaining = T::Currency::unreserve(who, deposit);
@@ -447,7 +446,7 @@ impl<T: Config> Pallet<T> {
 	///
 	/// Infallible
 	pub fn finalize_signed_phase_reject_solution(who: &T::AccountId, deposit: BalanceOf<T>) {
-		Self::deposit_event(crate::Event::Slashed(who.clone(), deposit));
+		Self::deposit_event(crate::Event::Slashed { account: who.clone(), value: deposit });
 		let (negative_imbalance, _remaining) = T::Currency::slash_reserved(who, deposit);
 		debug_assert!(_remaining.is_zero());
 		T::SlashHandler::on_unbalanced(negative_imbalance);
@@ -836,7 +835,8 @@ mod tests {
 				roll_to(15);
 				assert!(MultiPhase::current_phase().is_signed());
 
-				let (raw, witness) = MultiPhase::mine_solution(2).unwrap();
+				let (raw, witness) =
+					MultiPhase::mine_solution::<<Runtime as Config>::Solver>().unwrap();
 				let solution_weight = <Runtime as Config>::WeightInfo::feasibility_check(
 					witness.voters,
 					witness.targets,
