@@ -30,7 +30,7 @@ use self::{
 	sandbox::Sandbox,
 };
 use crate::{
-	exec::{AccountIdOf, StorageKey},
+	exec::{AccountIdOf, FixSizedKey, VarSizedKey},
 	schedule::{API_BENCHMARK_BATCH_SIZE, INSTR_BENCHMARK_BATCH_SIZE},
 	storage::Storage,
 	wasm::CallFlags,
@@ -132,13 +132,19 @@ where
 	}
 
 	/// Store the supplied storage items into this contracts storage.
-	fn store(&self, items: &Vec<(StorageKey, Vec<u8>)>) -> Result<(), &'static str> {
+	fn store(&self, items: &Vec<(FixSizedKey, Vec<u8>)>) -> Result<(), &'static str> {
 		let info = self.info()?;
 		for item in items {
-			Storage::<T>::write(&info.trie_id, &item.0, Some(item.1.clone()), None, false)
-				.map_err(|_| "Failed to write storage to restoration dest")?;
+			Storage::<T>::write(
+				&info.trie_id,
+				&item.0 as &FixSizedKey,
+				Some(item.1.clone()),
+				None,
+				false,
+			)
+			.map_err(|_| "Failed to write storage to restoration dest")?;
 		}
-		<ContractInfoOf<T>>::insert(&self.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&self.account_id, info);
 		Ok(())
 	}
 
@@ -202,8 +208,8 @@ benchmarks! {
 		<BalanceOf<T> as codec::HasCompact>::Type: Clone + Eq + PartialEq + sp_std::fmt::Debug + scale_info::TypeInfo + codec::Encode,
 	}
 
-	// The base weight without any actual work performed apart from the setup costs.
-	on_initialize {}: {
+	// The base weight consumed on processing contracts deletion queue.
+	on_process_deletion_queue_batch {}: {
 		Storage::<T>::process_deletion_queue_batch(Weight::MAX)
 	}
 
@@ -231,7 +237,7 @@ benchmarks! {
 	// first time after a new schedule was deployed: For every new schedule a contract needs
 	// to re-run the instrumentation once.
 	reinstrument {
-		let c in 0 .. T::Schedule::get().limits.code_len;
+		let c in 0 .. Perbill::from_percent(49).mul_ceil(T::MaxCodeLen::get());
 		let WasmModule { code, hash, .. } = WasmModule::<T>::sized(c, Location::Call);
 		Contracts::<T>::store_code_raw(code, whitelisted_caller())?;
 		let schedule = T::Schedule::get();
@@ -247,13 +253,13 @@ benchmarks! {
 	// which is in the wasm module but not executed on `call`.
 	// The results are supposed to be used as `call_with_code_kb(c) - call_with_code_kb(0)`.
 	call_with_code_per_byte {
-		let c in 0 .. T::Schedule::get().limits.code_len;
+		let c in 0 .. T::MaxCodeLen::get();
 		let instance = Contract::<T>::with_caller(
 			whitelisted_caller(), WasmModule::sized(c, Location::Deploy), vec![],
 		)?;
 		let value = T::Currency::minimum_balance();
 		let origin = RawOrigin::Signed(instance.caller.clone());
-		let callee = instance.addr.clone();
+		let callee = instance.addr;
 	}: call(origin, callee, value, Weight::MAX, None, vec![])
 
 	// This constructs a contract that is maximal expensive to instrument.
@@ -271,7 +277,7 @@ benchmarks! {
 	// We cannot let `c` grow to the maximum code size because the code is not allowed
 	// to be larger than the maximum size **after instrumentation**.
 	instantiate_with_code {
-		let c in 0 .. Perbill::from_percent(49).mul_ceil(T::Schedule::get().limits.code_len);
+		let c in 0 .. Perbill::from_percent(49).mul_ceil(T::MaxCodeLen::get());
 		let s in 0 .. code::max_pages::<T>() * 64 * 1024;
 		let salt = vec![42u8; s as usize];
 		let value = T::Currency::minimum_balance();
@@ -360,7 +366,7 @@ benchmarks! {
 	// We cannot let `c` grow to the maximum code size because the code is not allowed
 	// to be larger than the maximum size **after instrumentation**.
 	upload_code {
-		let c in 0 .. Perbill::from_percent(50).mul_ceil(T::Schedule::get().limits.code_len);
+		let c in 0 .. Perbill::from_percent(49).mul_ceil(T::MaxCodeLen::get());
 		let caller = whitelisted_caller();
 		T::Currency::make_free_balance_be(&caller, caller_funding::<T>());
 		let WasmModule { code, hash, .. } = WasmModule::<T>::sized(c, Location::Call);
@@ -391,10 +397,24 @@ benchmarks! {
 		assert!(<Contract<T>>::code_removed(&hash));
 	}
 
+	set_code {
+		let instance = <Contract<T>>::with_caller(
+			whitelisted_caller(), WasmModule::dummy(), vec![],
+		)?;
+		// we just add some bytes so that the code hash is different
+		let WasmModule { code, hash, .. } = <WasmModule<T>>::dummy_with_bytes(128);
+		<Contracts<T>>::store_code_raw(code, instance.caller.clone())?;
+		let callee = instance.addr.clone();
+		assert_ne!(instance.info()?.code_hash, hash);
+	}: _(RawOrigin::Root, callee, hash)
+	verify {
+		assert_eq!(instance.info()?.code_hash, hash);
+	}
+
 	seal_caller {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_caller", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_caller", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -409,7 +429,7 @@ benchmarks! {
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "__unstable__",
+				module: "seal0",
 				name: "seal_is_contract",
 				params: vec![ValueType::I32],
 				return_type: Some(ValueType::I32),
@@ -436,12 +456,65 @@ benchmarks! {
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
+	seal_code_hash {
+		let r in 0 .. API_BENCHMARK_BATCHES;
+		let accounts = (0 .. r * API_BENCHMARK_BATCH_SIZE)
+			.map(|n| account::<T::AccountId>("account", n, 0))
+			.collect::<Vec<_>>();
+		let account_len = accounts.get(0).map(|i| i.encode().len()).unwrap_or(0);
+		let accounts_bytes = accounts.iter().map(|a| a.encode()).flatten().collect::<Vec<_>>();
+		let accounts_len = accounts_bytes.len();
+		let pages = code::max_pages::<T>();
+		let code = WasmModule::<T>::from(ModuleDefinition {
+			memory: Some(ImportedMemory::max::<T>()),
+			imported_functions: vec![ImportedFunction {
+				module: "seal0",
+				name: "seal_code_hash",
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				return_type: Some(ValueType::I32),
+			}],
+			data_segments: vec![
+				DataSegment {
+					offset: 0,
+					value: 32u32.to_le_bytes().to_vec(), // output length
+				},
+				DataSegment {
+					offset: 36,
+					value: accounts_bytes,
+				},
+			],
+			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
+				Counter(36, account_len as u32), // address_ptr
+				Regular(Instruction::I32Const(4)), // ptr to output data
+				Regular(Instruction::I32Const(0)), // ptr to output length
+				Regular(Instruction::Call(0)),
+				Regular(Instruction::Drop),
+			])),
+			.. Default::default()
+		});
+		let instance = Contract::<T>::new(code, vec![])?;
+		let info = instance.info()?;
+		// every account would be a contract (worst case)
+		for acc in accounts.iter() {
+			<ContractInfoOf<T>>::insert(acc, info.clone());
+		}
+		let origin = RawOrigin::Signed(instance.caller.clone());
+	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
+
+	seal_own_code_hash {
+		let r in 0 .. API_BENCHMARK_BATCHES;
+		let instance = Contract::<T>::new(WasmModule::getter(
+			"seal0", "seal_own_code_hash", r * API_BENCHMARK_BATCH_SIZE
+		), vec![])?;
+		let origin = RawOrigin::Signed(instance.caller.clone());
+	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
+
 	seal_caller_is_origin {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "__unstable__",
+				module: "seal0",
 				name: "seal_caller_is_origin",
 				params: vec![],
 				return_type: Some(ValueType::I32),
@@ -459,7 +532,7 @@ benchmarks! {
 	seal_address {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_address", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_address", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -467,7 +540,7 @@ benchmarks! {
 	seal_gas_left {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_gas_left", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_gas_left", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -475,7 +548,7 @@ benchmarks! {
 	seal_balance {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_balance", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_balance", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -483,7 +556,7 @@ benchmarks! {
 	seal_value_transferred {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_value_transferred", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_value_transferred", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -491,7 +564,7 @@ benchmarks! {
 	seal_minimum_balance {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_minimum_balance", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_minimum_balance", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -499,7 +572,7 @@ benchmarks! {
 	seal_block_number {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_block_number", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_block_number", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -507,7 +580,7 @@ benchmarks! {
 	seal_now {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = Contract::<T>::new(WasmModule::getter(
-			"seal_now", r * API_BENCHMARK_BATCH_SIZE
+			"seal0", "seal_now", r * API_BENCHMARK_BATCH_SIZE
 		), vec![])?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
@@ -829,33 +902,37 @@ benchmarks! {
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	// Only the overhead of calling the function itself with minimal arguments.
-	// The contract is a bit more complex because I needs to use different keys in order
+	// The contract is a bit more complex because it needs to use different keys in order
 	// to generate unique storage accesses. However, it is still dominated by the storage
-	// accesses.
+	// accesses. We store all the keys that we are about to write at beforehand
+	// because re-writing at an existing key is always more expensive than writing
+	// it at a virgin key.
 	#[skip_meta]
 	seal_set_storage {
-		let r in 0 .. API_BENCHMARK_BATCHES;
+		let r in 0 .. API_BENCHMARK_BATCHES/2;
+		let max_key_len = T::MaxStorageKeyLen::get();
 		let keys = (0 .. r * API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
-		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
+		let keys_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_set_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
 				DataSegment {
 					offset: 0,
-					value: key_bytes,
+					value: keys_bytes,
 				},
 			],
 			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const(0)), // value_ptr
 				Regular(Instruction::I32Const(0)), // value_len
 				Regular(Instruction::Call(0)),
@@ -868,7 +945,7 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
 				Some(vec![]),
 				None,
 				false,
@@ -880,18 +957,19 @@ benchmarks! {
 
 	#[skip_meta]
 	seal_set_storage_per_new_kb {
-		let n in 0 .. T::Schedule::get().limits.payload_len / 1024;
-		let keys = (0 .. API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+		let n in 0 .. T::Schedule::get().limits.payload_len / 2048; // half of the max payload_len in kb
+		let max_key_len = T::MaxStorageKeyLen::get();
+		let keys = (0 .. n * API_BENCHMARK_BATCH_SIZE)
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_set_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -901,9 +979,10 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const(0)), // value_ptr
-				Regular(Instruction::I32Const((n * 1024) as i32)), // value_len
+				Regular(Instruction::I32Const((n * 2048) as i32)), // value_len increments by 2kb up to max payload_len
 				Regular(Instruction::Call(0)),
 				Regular(Instruction::Drop),
 			])),
@@ -914,7 +993,7 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
 				Some(vec![]),
 				None,
 				false,
@@ -926,18 +1005,19 @@ benchmarks! {
 
 	#[skip_meta]
 	seal_set_storage_per_old_kb {
-		let n in 0 .. T::Schedule::get().limits.payload_len / 1024;
-		let keys = (0 .. API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+		let n in 0 .. T::Schedule::get().limits.payload_len / 2048; // half of the max payload_len in kb
+		let max_key_len = T::MaxStorageKeyLen::get();
+		let keys = (0 .. n * API_BENCHMARK_BATCH_SIZE)
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_set_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -947,9 +1027,10 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const(0)), // value_ptr
-				Regular(Instruction::I32Const(0)), // value_len
+				Regular(Instruction::I32Const(0)), // value_len is 0 as testing vs pre-existing value len
 				Regular(Instruction::Call(0)),
 				Regular(Instruction::Drop),
 			])),
@@ -960,8 +1041,8 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
-				Some(vec![42u8; (n * 1024) as usize]),
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
+				Some(vec![42u8; (n * 2048) as usize]), // value_len increments by 2kb up to max payload_len
 				None,
 				false,
 			)
@@ -970,23 +1051,25 @@ benchmarks! {
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
-	// Similar to seal_set_storage. However, we store all the keys that we are about to
+	// Similar to seal_set_storage. We store all the keys that we are about to
 	// delete beforehand in order to prevent any optimizations that could occur when
-	// deleting a non existing key.
+	// deleting a non existing key. We generate keys of a maximum length, and have to
+	// reduce batch size in order to make resulting contract code size less than MaxCodeLen.
 	#[skip_meta]
 	seal_clear_storage {
-		let r in 0 .. API_BENCHMARK_BATCHES;
+		let r in 0 .. API_BENCHMARK_BATCHES/2;
+		let max_key_len = T::MaxStorageKeyLen::get();
 		let keys = (0 .. r * API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_clear_storage",
-				params: vec![ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -996,7 +1079,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32),
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::Call(0)),
 				Regular(Instruction::Drop),
 			])),
@@ -1007,31 +1091,32 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
 				Some(vec![]),
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	#[skip_meta]
 	seal_clear_storage_per_kb {
-		let n in 0 .. T::Schedule::get().limits.payload_len / 1024;
-		let keys = (0 .. API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+		let n in 0 .. T::Schedule::get().limits.payload_len / 2048; // half of the max payload_len in kb
+		let max_key_len = T::MaxStorageKeyLen::get();
+		let keys = (0 .. n * API_BENCHMARK_BATCH_SIZE)
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_clear_storage",
-				params: vec![ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1041,7 +1126,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::Call(0)),
 				Regular(Instruction::Drop),
 			])),
@@ -1052,8 +1138,8 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
-				Some(vec![42u8; (n * 1024) as usize]),
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
+				Some(vec![42u8; (n * 2048) as usize]), // value_len increments by 2kb up to max payload_len
 				None,
 				false,
 			)
@@ -1065,19 +1151,20 @@ benchmarks! {
 	// We make sure that all storage accesses are to unique keys.
 	#[skip_meta]
 	seal_get_storage {
-		let r in 0 .. API_BENCHMARK_BATCHES;
+		let r in 0 .. API_BENCHMARK_BATCHES/2;
+		let max_key_len = T::MaxStorageKeyLen::get();
 		let keys = (0 .. r * API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let key_bytes_len = key_bytes.len();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "seal0",
+				module: "__unstable__",
 				name: "seal_get_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1091,7 +1178,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const((key_bytes_len + 4) as i32)), // out_ptr
 				Regular(Instruction::I32Const(key_bytes_len as i32)), // out_len_ptr
 				Regular(Instruction::Call(0)),
@@ -1104,32 +1192,33 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
 				Some(vec![]),
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	#[skip_meta]
 	seal_get_storage_per_kb {
-		let n in 0 .. T::Schedule::get().limits.payload_len / 1024;
-		let keys = (0 .. API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+		let n in 0 .. T::Schedule::get().limits.payload_len / 2048; // half of the max payload_len in kb
+		let max_key_len = T::MaxStorageKeyLen::get();
+		let keys = (0 .. n * API_BENCHMARK_BATCH_SIZE)
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let key_bytes_len = key_bytes.len();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "seal0",
+				module: "__unstable__",
 				name: "seal_get_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1143,7 +1232,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const((key_bytes_len + 4) as i32)), // out_ptr
 				Regular(Instruction::I32Const(key_bytes_len as i32)), // out_len_ptr
 				Regular(Instruction::Call(0)),
@@ -1156,25 +1246,26 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
-				Some(vec![42u8; (n * 1024) as usize]),
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
+				Some(vec![42u8; (n * 2048) as usize]), // value_len increments by 2kb up to max payload_len
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	// We make sure that all storage accesses are to unique keys.
 	#[skip_meta]
 	seal_contains_storage {
-		let r in 0 .. API_BENCHMARK_BATCHES;
+		let r in 0 .. API_BENCHMARK_BATCHES/2;
+		let max_key_len = T::MaxStorageKeyLen::get();
 		let keys = (0 .. r * API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let key_bytes_len = key_bytes.len();
 		let code = WasmModule::<T>::from(ModuleDefinition {
@@ -1182,7 +1273,7 @@ benchmarks! {
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_contains_storage",
-				params: vec![ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1192,7 +1283,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::Call(0)),
 				Regular(Instruction::Drop),
 			])),
@@ -1203,31 +1295,32 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
 				Some(vec![]),
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	#[skip_meta]
 	seal_contains_storage_per_kb {
-		let n in 0 .. T::Schedule::get().limits.payload_len / 1024;
-		let keys = (0 .. API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+		let n in 0 .. T::Schedule::get().limits.payload_len / 2048; // half of the max payload_len in kb
+		let max_key_len = T::MaxStorageKeyLen::get();
+		let keys = (0 .. n * API_BENCHMARK_BATCH_SIZE)
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_contains_storage",
-				params: vec![ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1237,7 +1330,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::Call(0)),
 				Regular(Instruction::Drop),
 			])),
@@ -1248,24 +1342,25 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
-				Some(vec![42u8; (n * 1024) as usize]),
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
+				Some(vec![42u8; (n * 2048) as usize]), // value_len increments by 2kb up to max payload_len
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	#[skip_meta]
 	seal_take_storage {
-		let r in 0 .. API_BENCHMARK_BATCHES;
+		let r in 0 .. API_BENCHMARK_BATCHES/2;
+		let max_key_len = T::MaxStorageKeyLen::get();
 		let keys = (0 .. r * API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let key_bytes_len = key_bytes.len();
 		let code = WasmModule::<T>::from(ModuleDefinition {
@@ -1273,7 +1368,7 @@ benchmarks! {
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_take_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1287,7 +1382,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const((key_bytes_len + 4) as i32)), // out_ptr
 				Regular(Instruction::I32Const(key_bytes_len as i32)), // out_len_ptr
 				Regular(Instruction::Call(0)),
@@ -1300,24 +1396,25 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
 				Some(vec![]),
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
 	#[skip_meta]
 	seal_take_storage_per_kb {
-		let n in 0 .. T::Schedule::get().limits.payload_len / 1024;
-		let keys = (0 .. API_BENCHMARK_BATCH_SIZE)
-			.map(|n| T::Hashing::hash_of(&n).as_ref().to_vec())
-			.collect::<Vec<_>>();
-		let key_len = keys.get(0).map(|i| i.len() as u32).unwrap_or(0);
+		let n in 0 .. T::Schedule::get().limits.payload_len / 2048; // half of the max payload_len in kb
+		let max_key_len = T::MaxStorageKeyLen::get();
+		let keys = (0 .. n * API_BENCHMARK_BATCH_SIZE)
+				.map(|n| { let mut h = T::Hashing::hash_of(&n).as_ref().to_vec();
+						h.resize(max_key_len.try_into().unwrap(), n.to_le_bytes()[0]); h })
+		.collect::<Vec<_>>();
 		let key_bytes = keys.iter().flatten().cloned().collect::<Vec<_>>();
 		let key_bytes_len = key_bytes.len();
 		let code = WasmModule::<T>::from(ModuleDefinition {
@@ -1325,7 +1422,7 @@ benchmarks! {
 			imported_functions: vec![ImportedFunction {
 				module: "__unstable__",
 				name: "seal_take_storage",
-				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
+				params: vec![ValueType::I32, ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
 			}],
 			data_segments: vec![
@@ -1339,7 +1436,8 @@ benchmarks! {
 				},
 			],
 			call_body: Some(body::repeated_dyn(API_BENCHMARK_BATCH_SIZE, vec![
-				Counter(0, key_len as u32), // key_ptr
+				Counter(0, max_key_len as u32), // key_ptr
+				Regular(Instruction::I32Const(max_key_len as i32)), // key_len
 				Regular(Instruction::I32Const((key_bytes_len + 4) as i32)), // out_ptr
 				Regular(Instruction::I32Const(key_bytes_len as i32)), // out_len_ptr
 				Regular(Instruction::Call(0)),
@@ -1352,14 +1450,14 @@ benchmarks! {
 		for key in keys {
 			Storage::<T>::write(
 				&info.trie_id,
-				key.as_slice().try_into().map_err(|e| "Key has wrong length")?,
-				Some(vec![42u8; (n * 1024) as usize]),
+				&VarSizedKey::<T>::try_from(key).map_err(|e| "Key has wrong length")?,
+				Some(vec![42u8; (n * 2048) as usize]), // value_len increments by 2kb up to max payload_len
 				None,
 				false,
 			)
 			.map_err(|_| "Failed to write to storage during setup.")?;
 		}
-		<ContractInfoOf<T>>::insert(&instance.account_id, info.clone());
+		<ContractInfoOf<T>>::insert(&instance.account_id, info);
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
@@ -1492,7 +1590,7 @@ benchmarks! {
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "__unstable__",
+				module: "seal0",
 				name: "seal_delegate_call",
 				params: vec![
 					ValueType::I32,
@@ -1524,7 +1622,7 @@ benchmarks! {
 		});
 		let instance = Contract::<T>::new(code, vec![])?;
 		let callee = instance.addr.clone();
-		let origin = RawOrigin::Signed(instance.caller.clone());
+		let origin = RawOrigin::Signed(instance.caller);
 	}: call(origin, callee, 0u32.into(), Weight::MAX, None, vec![])
 
 	seal_call_per_transfer_clone_kb {
@@ -1686,7 +1784,7 @@ benchmarks! {
 			.collect::<Vec<_>>();
 
 		for addr in &addresses {
-			if let Some(_) = ContractInfoOf::<T>::get(&addr) {
+			if ContractInfoOf::<T>::get(&addr).is_some() {
 				return Err("Expected that contract does not exist at this point.".into());
 			}
 		}
@@ -1694,7 +1792,7 @@ benchmarks! {
 	verify {
 		for addr in &addresses {
 			ContractInfoOf::<T>::get(&addr)
-				.ok_or_else(|| "Contract should have been instantiated")?;
+				.ok_or("Contract should have been instantiated")?;
 		}
 	}
 
@@ -1702,7 +1800,7 @@ benchmarks! {
 		let t in 0 .. 1;
 		let s in 0 .. (code::max_pages::<T>() - 1) * 64;
 		let callee_code = WasmModule::<T>::dummy();
-		let hash = callee_code.hash.clone();
+		let hash = callee_code.hash;
 		let hash_bytes = callee_code.hash.encode();
 		let hash_len = hash_bytes.len();
 		Contracts::<T>::store_code_raw(callee_code.code, whitelisted_caller())?;
@@ -1866,20 +1964,14 @@ benchmarks! {
 	// It generates different private keys and signatures for the message "Hello world".
 	seal_ecdsa_recover {
 		let r in 0 .. API_BENCHMARK_BATCHES;
-		use rand::SeedableRng;
-		let mut rng = rand_pcg::Pcg32::seed_from_u64(123456);
 
 		let message_hash = sp_io::hashing::blake2_256("Hello world".as_bytes());
+		let key_type = sp_core::crypto::KeyTypeId(*b"code");
 		let signatures = (0..r * API_BENCHMARK_BATCH_SIZE)
 			.map(|i| {
-				use libsecp256k1::{SecretKey, Message, sign};
-
-				let private_key = SecretKey::random(&mut rng);
-				let (signature, recovery_id) = sign(&Message::parse(&message_hash), &private_key);
-				let mut full_signature = [0; 65];
-				full_signature[..64].copy_from_slice(&signature.serialize());
-				full_signature[64] = recovery_id.serialize();
-				full_signature
+				let pub_key = sp_io::crypto::ecdsa_generate(key_type, None);
+				let sig = sp_io::crypto::ecdsa_sign_prehashed(key_type, &pub_key, &message_hash).expect("Generates signature");
+				AsRef::<[u8; 65]>::as_ref(&sig).to_vec()
 			})
 			.collect::<Vec<_>>();
 		let signatures = signatures.iter().flatten().cloned().collect::<Vec<_>>();
@@ -1888,7 +1980,7 @@ benchmarks! {
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "__unstable__",
+				module: "seal0",
 				name: "seal_ecdsa_recover",
 				params: vec![ValueType::I32, ValueType::I32, ValueType::I32],
 				return_type: Some(ValueType::I32),
@@ -1916,6 +2008,44 @@ benchmarks! {
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
 
+	// Only calling the function itself for the list of
+	// generated different ECDSA keys.
+	seal_ecdsa_to_eth_address {
+		let r in 0 .. API_BENCHMARK_BATCHES;
+		let key_type = sp_core::crypto::KeyTypeId(*b"code");
+		let pub_keys_bytes = (0..r * API_BENCHMARK_BATCH_SIZE)
+			.map(|_| {
+				sp_io::crypto::ecdsa_generate(key_type, None).0
+			})
+		.flatten()
+		.collect::<Vec<_>>();
+		let pub_keys_bytes_len = pub_keys_bytes.len() as i32;
+		let code = WasmModule::<T>::from(ModuleDefinition {
+			memory: Some(ImportedMemory::max::<T>()),
+			imported_functions: vec![ImportedFunction {
+				module: "seal0",
+				name: "seal_ecdsa_to_eth_address",
+				params: vec![ValueType::I32, ValueType::I32],
+				return_type: Some(ValueType::I32),
+			}],
+			data_segments: vec![
+				DataSegment {
+					offset: 0,
+					value: pub_keys_bytes,
+				},
+			],
+			call_body: Some(body::repeated_dyn(r * API_BENCHMARK_BATCH_SIZE, vec![
+				Counter(0, 33), // pub_key_ptr
+				Regular(Instruction::I32Const(pub_keys_bytes_len)), // out_ptr
+				Regular(Instruction::Call(0)),
+				Regular(Instruction::Drop),
+			])),
+			.. Default::default()
+		});
+		let instance = Contract::<T>::new(code, vec![])?;
+		let origin = RawOrigin::Signed(instance.caller.clone());
+	}: call(origin, instance.addr, 0u32.into(), Weight::MAX, None, vec![])
+
 	seal_set_code_hash {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let code_hashes = (0..r * API_BENCHMARK_BATCH_SIZE)
@@ -1932,7 +2062,7 @@ benchmarks! {
 		let code = WasmModule::<T>::from(ModuleDefinition {
 			memory: Some(ImportedMemory::max::<T>()),
 			imported_functions: vec![ImportedFunction {
-				module: "__unstable__",
+				module: "seal0",
 				name: "seal_set_code_hash",
 				params: vec![
 					ValueType::I32,
@@ -2250,7 +2380,7 @@ benchmarks! {
 	// w_local_get = w_bench - 1 * w_param
 	instr_local_get {
 		let r in 0 .. INSTR_BENCHMARK_BATCHES;
-		let max_locals = T::Schedule::get().limits.stack_height;
+		let max_locals = T::Schedule::get().limits.stack_height.unwrap_or(512);
 		let mut call_body = body::repeated_dyn(r * INSTR_BENCHMARK_BATCH_SIZE, vec![
 			RandomGetLocal(0, max_locals),
 			Regular(Instruction::Drop),
@@ -2267,7 +2397,7 @@ benchmarks! {
 	// w_local_set = w_bench - 1 * w_param
 	instr_local_set {
 		let r in 0 .. INSTR_BENCHMARK_BATCHES;
-		let max_locals = T::Schedule::get().limits.stack_height;
+		let max_locals = T::Schedule::get().limits.stack_height.unwrap_or(512);
 		let mut call_body = body::repeated_dyn(r * INSTR_BENCHMARK_BATCH_SIZE, vec![
 			RandomI64Repeated(1),
 			RandomSetLocal(0, max_locals),
@@ -2284,7 +2414,7 @@ benchmarks! {
 	// w_local_tee = w_bench - 2 * w_param
 	instr_local_tee {
 		let r in 0 .. INSTR_BENCHMARK_BATCHES;
-		let max_locals = T::Schedule::get().limits.stack_height;
+		let max_locals = T::Schedule::get().limits.stack_height.unwrap_or(512);
 		let mut call_body = body::repeated_dyn(r * INSTR_BENCHMARK_BATCH_SIZE, vec![
 			RandomI64Repeated(1),
 			RandomTeeLocal(0, max_locals),
@@ -2347,7 +2477,7 @@ benchmarks! {
 	}
 
 	// w_memory_grow = w_bench - 2 * w_param
-	// We can only allow allocate as much memory as it is allowed in a a contract.
+	// We can only allow allocate as much memory as it is allowed in a contract.
 	// Therefore the repeat count is limited by the maximum memory any contract can have.
 	// Using a contract with more memory will skew the benchmark because the runtime of grow
 	// depends on how much memory is already allocated.
